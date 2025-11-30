@@ -3,26 +3,32 @@ package http
 import (
 	"database/sql"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 
 	"sessionservice/internal/db"
 	"sessionservice/internal/middleware"
+	"sessionservice/internal/session"
 	"sessionservice/internal/token"
 )
 
 // AuthHandler 負責處理與帳號/登入相關的 HTTP 請求。
 type AuthHandler struct {
-	q      *db.Queries
-	jwtMgr *token.Manager
+	q         *db.Queries
+	jwtMgr    *token.Manager
+	sessSvc   *session.SessionService
+	tokenTTL  time.Duration
 }
 
 // NewAuthHandler 建立 AuthHandler。
-func NewAuthHandler(q *db.Queries, jwtMgr *token.Manager) *AuthHandler {
+func NewAuthHandler(q *db.Queries, jwtMgr *token.Manager, sessSvc *session.SessionService, tokenTTL time.Duration) *AuthHandler {
 	return &AuthHandler{
-		q:      q,
-		jwtMgr: jwtMgr,
+		q:        q,
+		jwtMgr:   jwtMgr,
+		sessSvc:  sessSvc,
+		tokenTTL: tokenTTL,
 	}
 }
 
@@ -80,31 +86,31 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	user, err := h.q.GetUserByUsername(ctx, req.Username)
+
+	meta := session.LoginMeta{
+		IP:        c.ClientIP(),
+		UserAgent: c.GetHeader("User-Agent"),
+	}
+
+	user, sessionID, expiresAt, err := h.sessSvc.Login(ctx, req.Username, req.Password, meta)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if err == session.ErrInvalidCredentials {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query user"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "login failed"})
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
-		return
-	}
-
-	tokenStr, err := h.jwtMgr.Generate(user.ID)
+	tokenStr, err := h.jwtMgr.GenerateWithSession(user.ID, sessionID, expiresAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 		return
 	}
 
-	// jwtMgr 的 TTL 是在建立時設定的，這裡示意用 24h。
 	c.JSON(http.StatusOK, loginResponse{
 		AccessToken: tokenStr,
-		ExpiresIn:   h.jwtMgrTTL(),
+		ExpiresIn:   int64(h.tokenTTL.Seconds()),
 	})
 }
 
@@ -140,11 +146,36 @@ func (h *AuthHandler) Me(c *gin.Context) {
 	})
 }
 
-// h.jwtMgr 的 TTL 我們沒有對外暴露，這裡簡單寫死 24h，確保回應有值。
-// 若你想更精準，可以將 TTL 存在 config 並在 handler 也保存。
-func (h *AuthHandler) jwtMgrTTL() int64 {
-	// 24 hours
-	return 24 * 60 * 60
+// Logout：從 context 取得 userID / sessionID，呼叫 SessionService.Logout。
+func (h *AuthHandler) Logout(c *gin.Context) {
+	userIDVal, ok := c.Get(middleware.ContextKeyUserID)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing user in context"})
+		return
+	}
+	sessionIDVal, ok := c.Get(middleware.ContextKeySessionID)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing session in context"})
+		return
+	}
+
+	userID, ok := userIDVal.(int64)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid user id type"})
+		return
+	}
+	sessionID, ok := sessionIDVal.(string)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid session id type"})
+		return
+	}
+
+	if err := h.sessSvc.Logout(c.Request.Context(), userID, sessionID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "logout failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 

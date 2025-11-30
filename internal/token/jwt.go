@@ -9,10 +9,12 @@ import (
 
 // Claims 定義我們在 JWT 中使用的 claims。
 // - sub: user ID
+// - sid: session ID
 // - exp: 過期時間
 // - iat: 發行時間
 type Claims struct {
-	UserID int64 `json:"sub"`
+	UserID    int64  `json:"sub"`
+	SessionID string `json:"sid"`
 	jwt.RegisteredClaims
 }
 
@@ -35,10 +37,26 @@ func NewManager(secret string, ttl time.Duration) *Manager {
 func (m *Manager) Generate(userID int64) (string, error) {
 	now := time.Now()
 	claims := &Claims{
-		UserID: userID,
+		UserID:    userID,
+		SessionID: "",
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(m.ttl)),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(m.secret)
+}
+
+// GenerateWithSession 為指定 user + session 產生一顆 JWT，並使用指定的 expiresAt。
+func (m *Manager) GenerateWithSession(userID int64, sessionID string, expiresAt time.Time) (string, error) {
+	now := time.Now()
+	claims := &Claims{
+		UserID:    userID,
+		SessionID: sessionID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(expiresAt),
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
