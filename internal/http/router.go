@@ -12,8 +12,14 @@ import (
 )
 
 // NewRouter 建立並回傳一個已註冊好路由的 *gin.Engine。
-// Phase 2：處理 /health, /auth/signup, /auth/login, /auth/logout, /me。
-func NewRouter(q *db.Queries, jwtMgr *token.Manager, sessSvc *session.SessionService, tokenTTL time.Duration) *gin.Engine {
+// 處理 /health, /auth/*, /me, 以及 /admin/* 管理端 API。
+func NewRouter(
+	q *db.Queries,
+	jwtMgr *token.Manager,
+	sessSvc *session.SessionService,
+	tokenTTL time.Duration,
+	adminAPIKey string,
+) *gin.Engine {
 	r := gin.Default()
 
 	// Health check
@@ -22,6 +28,7 @@ func NewRouter(q *db.Queries, jwtMgr *token.Manager, sessSvc *session.SessionSer
 	})
 
 	authHandler := NewAuthHandler(q, jwtMgr, sessSvc, tokenTTL)
+	adminHandler := NewAdminHandler(sessSvc)
 
 	// 不需驗證的 auth 路由
 	auth := r.Group("/auth")
@@ -36,6 +43,16 @@ func NewRouter(q *db.Queries, jwtMgr *token.Manager, sessSvc *session.SessionSer
 	{
 		authRequired.GET("/me", authHandler.Me)
 		authRequired.POST("/auth/logout", authHandler.Logout)
+	}
+
+	// Admin routes（用簡單的 API key middleware 保護）
+	adminGroup := r.Group("/admin")
+	adminGroup.Use(middleware.NewAdminAPIKeyMiddleware(adminAPIKey))
+	{
+		adminGroup.GET("/users/:id/sessions", adminHandler.ListUserSessions)
+		adminGroup.POST("/users/:id/kick", adminHandler.KickUserSessions)
+		adminGroup.POST("/users/:id/ban", adminHandler.BanUser)
+		adminGroup.POST("/users/:id/unban", adminHandler.UnbanUser)
 	}
 
 	return r

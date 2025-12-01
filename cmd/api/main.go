@@ -10,8 +10,8 @@ import (
 
 	"sessionservice/internal/config"
 	"sessionservice/internal/db"
-	"sessionservice/internal/infra"
 	httpapi "sessionservice/internal/http"
+	"sessionservice/internal/infra"
 	"sessionservice/internal/session"
 	"sessionservice/internal/token"
 
@@ -50,14 +50,18 @@ func main() {
 	rdb := infra.NewRedisClient(cfg)
 	defer rdb.Close()
 
+	// Asynq client（給 SessionService 使用）
+	asynqClient := infra.NewAsynqClient(cfg)
+	defer asynqClient.Close()
+
 	// Session service
-	sessSvc := session.NewSessionService(q, rdb, cfg)
+	sessSvc := session.NewSessionService(q, rdb, cfg, asynqClient)
 
 	// JWT manager（預設存活時間使用 cfg.SessionTTL）
 	jwtMgr := token.NewManager(cfg.JWTSecret, cfg.SessionTTL)
 
 	// 建立 router
-	r := httpapi.NewRouter(q, jwtMgr, sessSvc, cfg.SessionTTL)
+	r := httpapi.NewRouter(q, jwtMgr, sessSvc, cfg.SessionTTL, cfg.AdminAPIKey)
 
 	// 啟動 HTTP server
 	gin.SetMode(gin.ReleaseMode)
@@ -86,5 +90,3 @@ func runMigrations(dbConn *sql.DB) error {
 	}
 	return nil
 }
-
-

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 
@@ -24,21 +25,24 @@ type LoginMeta struct {
 
 // SessionService 處理與 session 相關的 domain 邏輯。
 type SessionService struct {
-	q   *db.Queries
-	rdb *redis.Client
-	cfg *config.Config
+	q          *db.Queries
+	rdb        *redis.Client
+	cfg        *config.Config
+	asynqClient *asynq.Client
 }
 
-func NewSessionService(q *db.Queries, rdb *redis.Client, cfg *config.Config) *SessionService {
+func NewSessionService(q *db.Queries, rdb *redis.Client, cfg *config.Config, asynqClient *asynq.Client) *SessionService {
 	return &SessionService{
-		q:   q,
-		rdb: rdb,
-		cfg: cfg,
+		q:          q,
+		rdb:        rdb,
+		cfg:        cfg,
+		asynqClient: asynqClient,
 	}
 }
 
 var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
+	ErrUserBanned         = errors.New("user is banned")
 )
 
 // Login 驗證帳密，建立 Redis session，並寫入 sessions 資料表。
@@ -51,13 +55,56 @@ func (s *SessionService) Login(
 	u, err := s.q.GetUserByUsername(ctx, username)
 	if err != nil {
 		if err == sql.ErrNoRows {
+			// 登入失敗 audit
+			_ = infra.EnqueueLoginAudit(ctx, s.asynqClient, infra.LoginAuditPayload{
+				UserID:    nil,
+				Username:  username,
+				Success:   false,
+				Reason:    "user_not_found",
+				IP:        meta.IP,
+				UserAgent: meta.UserAgent,
+			})
 			return db.User{}, "", time.Time{}, ErrInvalidCredentials
 		}
 		return db.User{}, "", time.Time{}, err
 	}
 
+	// 檢查是否被 ban（DB）
+	if u.IsBanned {
+		_ = infra.EnqueueLoginAudit(ctx, s.asynqClient, infra.LoginAuditPayload{
+			UserID:    &u.ID,
+			Username:  u.Username,
+			Success:   false,
+			Reason:    "banned_db",
+			IP:        meta.IP,
+			UserAgent: meta.UserAgent,
+		})
+		return db.User{}, "", time.Time{}, ErrUserBanned
+	}
+
+	// 檢查是否被 ban（Redis flag）
+	if banned, err := s.rdb.Exists(ctx, infra.BannedUserKey(u.ID)).Result(); err == nil && banned > 0 {
+		_ = infra.EnqueueLoginAudit(ctx, s.asynqClient, infra.LoginAuditPayload{
+			UserID:    &u.ID,
+			Username:  u.Username,
+			Success:   false,
+			Reason:    "banned_redis",
+			IP:        meta.IP,
+			UserAgent: meta.UserAgent,
+		})
+		return db.User{}, "", time.Time{}, ErrUserBanned
+	}
+
 	// 2. 驗證密碼（沿用 Phase 1 的 bcrypt 邏輯）
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
+		_ = infra.EnqueueLoginAudit(ctx, s.asynqClient, infra.LoginAuditPayload{
+			UserID:    &u.ID,
+			Username:  u.Username,
+			Success:   false,
+			Reason:    "wrong_password",
+			IP:        meta.IP,
+			UserAgent: meta.UserAgent,
+		})
 		return db.User{}, "", time.Time{}, ErrInvalidCredentials
 	}
 
@@ -128,6 +175,17 @@ func (s *SessionService) Login(
 		return db.User{}, "", time.Time{}, err
 	}
 
+	// 建立 Asynq 任務：session:expire 與 login:audit
+	_ = infra.EnqueueSessionExpire(ctx, s.asynqClient, newSID, u.ID, expiresAt)
+	_ = infra.EnqueueLoginAudit(ctx, s.asynqClient, infra.LoginAuditPayload{
+		UserID:    &u.ID,
+		Username:  u.Username,
+		Success:   true,
+		Reason:    "ok",
+		IP:        meta.IP,
+		UserAgent: meta.UserAgent,
+	})
+
 	return u, newSID, expiresAt, nil
 }
 
@@ -149,6 +207,92 @@ func (s *SessionService) Logout(ctx context.Context, userID int64, sessionID str
 		RevokedBy: sql.NullString{String: "user", Valid: true},
 	})
 
+	return nil
+}
+
+// ListActiveSessions 列出某 user 的活躍 sessions（從 Redis 讀取）。
+type ActiveSessionInfo struct {
+	SessionID string `json:"session_id"`
+	IP        string `json:"ip,omitempty"`
+	UserAgent string `json:"user_agent,omitempty"`
+}
+
+func (s *SessionService) ListActiveSessions(ctx context.Context, userID int64) ([]ActiveSessionInfo, error) {
+	key := infra.UserSessKey(userID)
+	sessionIDs, err := s.rdb.ZRange(ctx, key, 0, -1).Result()
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	var result []ActiveSessionInfo
+	for _, sid := range sessionIDs {
+		data, err := s.rdb.HGetAll(ctx, infra.SessKey(sid)).Result()
+		if err != nil && err != redis.Nil {
+			return nil, err
+		}
+		if len(data) == 0 {
+			continue
+		}
+		result = append(result, ActiveSessionInfo{
+			SessionID: sid,
+			IP:        data["ip"],
+			UserAgent: data["user_agent"],
+		})
+	}
+	return result, nil
+}
+
+// KickSession 強制踢掉指定 session。
+func (s *SessionService) KickSession(ctx context.Context, userID int64, sessionID string) error {
+	sessKey := infra.SessKey(sessionID)
+	userSessKey := infra.UserSessKey(userID)
+
+	pipe := s.rdb.TxPipeline()
+	pipe.Del(ctx, sessKey)
+	pipe.ZRem(ctx, userSessKey, sessionID)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+
+	_ = s.q.RevokeSession(ctx, db.RevokeSessionParams{
+		ID:        sessionID,
+		RevokedBy: sql.NullString{String: "admin:kick", Valid: true},
+	})
+	return nil
+}
+
+// KickAllSessions 踢掉該 user 所有活躍 session。
+func (s *SessionService) KickAllSessions(ctx context.Context, userID int64) error {
+	key := infra.UserSessKey(userID)
+	sessionIDs, err := s.rdb.ZRange(ctx, key, 0, -1).Result()
+	if err != nil && err != redis.Nil {
+		return err
+	}
+	for _, sid := range sessionIDs {
+		_ = s.KickSession(ctx, userID, sid)
+	}
+	return nil
+}
+
+// BanUser 封鎖 user，更新 DB 與 Redis，並踢掉所有 sessions。
+func (s *SessionService) BanUser(ctx context.Context, userID int64) error {
+	if err := s.q.BanUser(ctx, userID); err != nil {
+		return err
+	}
+	if err := s.rdb.Set(ctx, infra.BannedUserKey(userID), "1", 0).Err(); err != nil {
+		return err
+	}
+	return s.KickAllSessions(ctx, userID)
+}
+
+// UnbanUser 解除封鎖 user。
+func (s *SessionService) UnbanUser(ctx context.Context, userID int64) error {
+	if err := s.q.UnbanUser(ctx, userID); err != nil {
+		return err
+	}
+	if err := s.rdb.Del(ctx, infra.BannedUserKey(userID)).Err(); err != nil {
+		return err
+	}
 	return nil
 }
 

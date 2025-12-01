@@ -9,6 +9,17 @@ import (
 	"context"
 )
 
+const banUser = `-- name: BanUser :exec
+UPDATE users
+SET is_banned = 1
+WHERE id = ?1
+`
+
+func (q *Queries) BanUser(ctx context.Context, id int64) error {
+	_, err := q.db.ExecContext(ctx, banUser, id)
+	return err
+}
+
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (
     username,
@@ -21,7 +32,8 @@ RETURNING
     id,
     username,
     password_hash,
-    created_at
+    created_at,
+    is_banned
 `
 
 type CreateUserParams struct {
@@ -37,6 +49,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.Username,
 		&i.PasswordHash,
 		&i.CreatedAt,
+		&i.IsBanned,
 	)
 	return i, err
 }
@@ -46,7 +59,8 @@ SELECT
     id,
     username,
     password_hash,
-    created_at
+    created_at,
+    is_banned
 FROM users
 WHERE id = ?1
 LIMIT 1
@@ -60,6 +74,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
 		&i.Username,
 		&i.PasswordHash,
 		&i.CreatedAt,
+		&i.IsBanned,
 	)
 	return i, err
 }
@@ -69,7 +84,8 @@ SELECT
     id,
     username,
     password_hash,
-    created_at
+    created_at,
+    is_banned
 FROM users
 WHERE username = ?1
 LIMIT 1
@@ -83,6 +99,18 @@ func (q *Queries) GetUserByUsername(ctx context.Context, username string) (User,
 		&i.Username,
 		&i.PasswordHash,
 		&i.CreatedAt,
+		&i.IsBanned,
 	)
 	return i, err
+}
+
+const unbanUser = `-- name: UnbanUser :exec
+UPDATE users
+SET is_banned = 0
+WHERE id = ?1
+`
+
+func (q *Queries) UnbanUser(ctx context.Context, id int64) error {
+	_, err := q.db.ExecContext(ctx, unbanUser, id)
+	return err
 }

@@ -20,6 +20,12 @@ type Config struct {
 	// Session 設定
 	SessionTTL         time.Duration
 	MaxSessionsPerUser int
+
+	// Asynq worker 設定
+	AsynqConcurrency int
+
+	// Admin API key
+	AdminAPIKey string
 }
 
 // Load 從環境變數載入設定，並給預設值。
@@ -34,9 +40,13 @@ func Load() *Config {
 
 	defaultSessionTTLSeconds := 3600 // 1 小時
 	defaultMaxSessionsPerUser := 2
+	defaultAsynqConcurrency := 10
 
 	ttlSeconds := getenvInt("SESSION_TTL_SECONDS", defaultSessionTTLSeconds)
 	maxSessions := getenvInt("MAX_SESSIONS_PER_USER", defaultMaxSessionsPerUser)
+	asynqConc := getenvInt("ASYNQ_CONCURRENCY", defaultAsynqConcurrency)
+
+	adminAPIKey := getenv("ADMIN_API_KEY", "dev-admin")
 
 	return &Config{
 		HTTPAddr: getenv("APP_HTTP_ADDR", defaultHTTPAddr),
@@ -48,6 +58,9 @@ func Load() *Config {
 
 		SessionTTL:         time.Duration(ttlSeconds) * time.Second,
 		MaxSessionsPerUser: maxSessions,
+
+		AsynqConcurrency: asynqConc,
+		AdminAPIKey:      adminAPIKey,
 	}
 }
 

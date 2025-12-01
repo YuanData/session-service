@@ -9,6 +9,17 @@ import (
 	"time"
 )
 
+type LoginEvent struct {
+	ID        int64          `json:"id"`
+	UserID    interface{}    `json:"user_id"`
+	Username  sql.NullString `json:"username"`
+	Success   bool           `json:"success"`
+	Reason    sql.NullString `json:"reason"`
+	Ip        sql.NullString `json:"ip"`
+	UserAgent sql.NullString `json:"user_agent"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+
 type Session struct {
 	ID        string         `json:"id"`
 	UserID    int64          `json:"user_id"`
@@ -23,4 +34,5 @@ type User struct {
 	Username     string    `json:"username"`
 	PasswordHash string    `json:"password_hash"`
 	CreatedAt    time.Time `json:"created_at"`
+	IsBanned     bool      `json:"is_banned"`
 }
