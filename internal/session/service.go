@@ -158,7 +158,7 @@ func (s *SessionService) Login(
 	})
 	pipe.ExpireAt(ctx, sessKey, expiresAt)
 	pipe.ZAdd(ctx, userSessKey, redis.Z{
-		Score:  float64(now.Unix()),
+		Score:  float64(now.UnixNano()), // 使用 UnixNano 當 score，確保每次登入都有嚴格遞增的時間序，避免同一秒內多次登入導致排序不穩定
 		Member: newSID,
 	})
 	if _, err := pipe.Exec(ctx); err != nil {
