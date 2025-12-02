@@ -29,12 +29,15 @@ internal/
 
 db/
   migrations/
-    001_init.sql        # users table 建表
+    001_init.up.sql            # 由 golang-migrate 管理的 migration（建 users table）
+    002_add_sessions.up.sql    # 新增 sessions 表
+    003_add_login_events.up.sql# 新增 login_events 稽核表
+    004_add_user_ban.up.sql    # 在 users 表新增 is_banned 欄位
   queries/
-    users.sql           # CreateUser, GetUserByUsername, GetUserByID（給 sqlc 用）
+    users.sql                  # CreateUser, GetUserByUsername, GetUserByID（給 sqlc 用）
 
-sqlc.yaml               # sqlc 設定，產出 internal/db package
-go.mod                  # Go module & 依賴
+sqlc.yaml                      # sqlc 設定，產出 internal/db package
+go.mod                         # Go module & 依賴（Go 1.23 / 使用 viper + golang-migrate）
 ```
 
 ---
@@ -55,7 +58,7 @@ sqlc generate
 
 這會根據：
 
-- `db/migrations/*.sql`
+- `db/migrations/*.up.sql`
 - `db/queries/*.sql`
 
 產生 `internal/db` package，裡面會有：
@@ -65,6 +68,13 @@ sqlc generate
 - `CreateUser`、`GetUserByUsername`、`GetUserByID` 等方法。
 
 > 若沒有先跑 `sqlc generate`，`go run ./cmd/api` 會因為缺少 `internal/db` 而無法編譯。
+
+3. 準備環境檔與 Go 版本：
+
+- 建議安裝 **Go 1.23 以上**，專案使用 `toolchain go1.24.2`。
+- 參考 `.env.example` 產生 `.env`，把 `APP_JWT_SECRET` 等敏感資訊放在 `.env` 或環境變數中。
+
+> `.env` 檔已在 `.gitignore` 中忽略，實際密鑰不會被 commit；只會保留 `.env.example` 作為範例。
 
 ---
 
@@ -79,11 +89,17 @@ go mod tidy
 # 2. 產生 sqlc 程式碼
 sqlc generate
 
-# 3. 啟動 API（會自動建立 ./data/app.db 並跑 001_init.sql）
-APP_HTTP_ADDR=":8080" \
-APP_DB_PATH="./data/app.db" \
-APP_JWT_SECRET="dev-secret-change-me" \
+# 3. 準備環境變數（建議從範例複製一份 .env）
+cp .env.example .env
+# 打開 .env，依需求修改 APP_JWT_SECRET / REDIS_ADDR 等設定
+
+# 4. 啟動 API（啟動時會自動使用 golang-migrate 執行 db/migrations/*.up.sql）
 go run ./cmd/api
+
+# 若你先前已經有舊的 ./data/app.db（非 golang-migrate 建立），
+# 建議在本機開發環境先刪除後再啟動，讓 migrate 從 version 1 開始完整建立 schema：
+# rm -f ./data/app.db
+# go run ./cmd/api
 ```
 
 啟動後，服務會監聽在 `http://localhost:8080`。
@@ -211,7 +227,7 @@ Phase 2 在 Phase 1 的基礎上，加入 **Redis Session 管理 + 同時登入�
       - score：`created_at` 的 UNIX time。
 
 - **Sessions 表與 sqlc**
-  - `db/migrations/002_add_sessions.sql`：
+  - `db/migrations/002_add_sessions.up.sql`：
     - `sessions (id TEXT PRIMARY KEY, user_id, created_at, expires_at, revoked_at, revoked_by)`。
   - `db/queries/sessions.sql`：
     - `CreateSession`：登入時記錄一筆 session。
@@ -289,13 +305,13 @@ Phase 2 在 Phase 1 的基礎上，加入 **Redis Session 管理 + 同時登入�
 
 - **main（`cmd/api/main.go`）**
   - 初始化流程：
-    - `cfg := config.Load()`
-    - 開啟 SQLite、`runMigrations` 執行 `db/migrations/*.sql`（包含 `001_init.sql` 與 `002_add_sessions.sql`）。
-    - `q := db.New(sqlDB)`
-    - `rdb := infra.NewRedisClient(cfg)`
-    - `sessSvc := session.NewSessionService(q, rdb, cfg)`
-    - `jwtMgr := token.NewManager(cfg.JWTSecret, cfg.SessionTTL)`
-    - `router := httpapi.NewRouter(q, jwtMgr, sessSvc, cfg.SessionTTL)`
+    - `cfg := config.Load()`：透過 **viper** 從 `.env` + 環境變數讀取設定（APP_HTTP_ADDR / APP_DB_PATH / APP_JWT_SECRET / REDIS_* / SESSION_* / ADMIN_API_KEY）。
+    - 開啟 SQLite（modernc driver）後，呼叫 `runMigrations`，使用 **golang-migrate** 讀取 `db/migrations/*.up.sql`，自動套用資料庫 schema。
+    - `q := db.New(sqlDB)`：建立 sqlc Queries。
+    - `rdb := infra.NewRedisClient(cfg)`：建立 Redis client。
+    - `sessSvc := session.NewSessionService(q, rdb, cfg, asynqClient)`：建立 SessionService。
+    - `jwtMgr := token.NewManager(cfg.JWTSecret, cfg.SessionTTL)`：建立 JWT manager。
+    - `router := httpapi.NewRouter(q, jwtMgr, sessSvc, cfg.SessionTTL, cfg.AdminAPIKey)`：建立 HTTP router。
 
 ---
 
@@ -307,7 +323,7 @@ Phase 2 在 Phase 1 的基礎上，加入 **Redis Session 管理 + 同時登入�
 docker run --rm -p 6379:6379 redis:7.4-alpine
 ```
 
-2. 啟動 API（Phase 2 版）：
+2. 準備環境變數（建議從範例複製一份 .env，並調整密鑰與 TTL）：
 
 ```bash
 cd /Users/user/session-service
@@ -315,12 +331,13 @@ cd /Users/user/session-service
 go mod tidy
 sqlc generate
 
-APP_HTTP_ADDR=":8080" \
-APP_DB_PATH="./data/app.db" \
-APP_JWT_SECRET="dev-secret-change-me" \
-REDIS_ADDR="127.0.0.1:6379" \
-SESSION_TTL_SECONDS=3600 \
-MAX_SESSIONS_PER_USER=2 \
+cp .env.example .env
+# 編輯 .env，確認以下重點：
+# - APP_JWT_SECRET：使用足夠隨機且長度足夠的密鑰
+# - REDIS_ADDR / REDIS_PASSWORD：指向正確的 Redis
+# - SESSION_TTL_SECONDS / MAX_SESSIONS_PER_USER：依需求調整
+
+# 啟動 API（Phase 2 版）
 go run ./cmd/api
 ```
 
@@ -567,7 +584,7 @@ Phase 3 在前兩階段的基礎上，加入：
 docker run --rm -p 6379:6379 redis:7.4-alpine
 ```
 
-2. 啟動 API：
+2. 準備環境變數（同樣建議從 .env.example 複製並修改密鑰與相關設定）：
 
 ```bash
 cd /Users/user/session-service
@@ -575,24 +592,22 @@ cd /Users/user/session-service
 go mod tidy
 sqlc generate
 
-APP_HTTP_ADDR=":8080" \
-APP_DB_PATH="./data/app.db" \
-APP_JWT_SECRET="dev-secret-change-me" \
-REDIS_ADDR="127.0.0.1:6379" \
-SESSION_TTL_SECONDS=3600 \
-MAX_SESSIONS_PER_USER=2 \
-ADMIN_API_KEY="dev-admin" \
+cp .env.example .env
+# 編輯 .env，至少確認：
+# - APP_JWT_SECRET：正式環境請改成強隨機長密鑰
+# - REDIS_ADDR / REDIS_PASSWORD：指向實際 Redis 服務
+# - SESSION_TTL_SECONDS / MAX_SESSIONS_PER_USER：依實際產品要求調整
+# - ADMIN_API_KEY：管理端 API 存取用金鑰
+
+# 啟動 API（Phase 3 版）
 go run ./cmd/api
 ```
 
-3. 啟動 Worker（另一個 terminal）：
+3. 啟動 Worker（另一個 terminal，會共用同一份 .env 設定）：
 
 ```bash
 cd /Users/user/session-service
 
-APP_DB_PATH="./data/app.db" \
-REDIS_ADDR="127.0.0.1:6379" \
-ASYNQ_CONCURRENCY=10 \
 go run ./cmd/worker
 ```
 

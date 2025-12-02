@@ -29,6 +29,5 @@ tmp/
 
 # Environment / secrets
 .env
-.env.*
 
 
