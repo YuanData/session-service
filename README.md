@@ -681,3 +681,48 @@ curl -s -X POST "$BASE_URL/admin/users/1/unban" \
   - 同時透過 `login:audit` 任務寫入 `login_events`，reason 會是 `banned_db` 或 `banned_redis`。
 
 
+
+---
+
+### 單元測試（使用 Testify）
+
+- **測試框架**
+  - 本專案使用 `github.com/stretchr/testify` 作為主要斷言工具，並搭配 Go 標準 `testing` 套件。
+  - 部分與 Redis 相關的邏輯（例如 `SessionService`、JWT middleware）會使用 `github.com/alicebob/miniredis/v2` 建立記憶體內的 Redis，避免依賴實體服務。
+
+- **相關測試檔一覽（節錄）**
+  - `internal/token/jwt_test.go`：測試 `token.Manager` 產生與解析 JWT 的行為。
+  - `internal/infra/redis_test.go`：測試 Redis key 命名工具（`SessKey`、`UserSessKey`、`BannedUserKey`）。
+  - `internal/middleware/admin_api_key_test.go`：測試 `AdminAPIKey` middleware 的放行與封鎖邏輯。
+  - `internal/middleware/auth_jwt_test.go`：在記憶體 Redis 上測試 JWT + Redis 雙重驗證的各種情境（缺 header / header 格式錯誤 / token 無 sid / session 不存在 / 成功通過）。
+  - `internal/session/service_test.go`：
+    - 使用 SQLite（:memory:）套用 `db/migrations/*.up.sql`，讓 schema 與正式環境一致。
+    - 搭配 miniredis 驗證 `SessionService` 的完整登入 / 登出 / session 限制 / ban / unban / session 驗證等邏輯。
+
+- **安裝測試相依套件**
+
+```bash
+cd /Users/alan/CodeSpace/DireSoft
+
+# 安裝測試所需套件（第一次執行前建議先跑）
+go get github.com/stretchr/testify
+go get github.com/alicebob/miniredis/v2
+```
+
+- **執行全部測試**
+
+```bash
+cd /Users/alan/CodeSpace/DireSoft
+
+# 建議先確保 sqlc 已產生 internal/db（若尚未生成）
+sqlc generate
+
+# 執行全部 Go 單元測試（會跑 internal/* 及其他套件的測試）
+go test ./...
+```
+
+- **測試注意事項**
+  - 測試程式使用記憶體 SQLite（`sqlite :memory:`）與記憶體 Redis（miniredis），不會碰觸實際的 `./data/app.db` 與外部 Redis 服務。
+  - 測試會直接從 `db/migrations/*.up.sql` 讀取 SQL 並套用到記憶體資料庫，以確保與實際 schema 保持同步。
+  - 若你有新增 / 修改 migration 或 `SessionService` 等邏輯，建議同步新增或調整對應的測試案例，再重新執行 `go test ./...` 確認一切通過。
+
